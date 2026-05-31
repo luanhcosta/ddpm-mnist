@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Data cache
+data_cache/
+
+# Results (keep structure, ignore content)
+results/checkpoints/*.pt
+results/samples/**/*.png
+results/samples/**/*.gif
+results/metrics/*.csv
+results/profiling/*.json
+results/profiling/*.txt
+results/plots/*.png
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
