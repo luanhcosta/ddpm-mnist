@@ -14,7 +14,14 @@ from utils.metrics import MetricsLogger, GPUMemoryTracker
 
 
 class Trainer:
-    def __init__(self, cfg: Config, model: UNet, diffusion: DiffusionProcess, dataloader: torch.utils.data.DataLoader):
+    def __init__(
+        self,
+        cfg: Config,
+        model: UNet,
+        diffusion: DiffusionProcess,
+        dataloader: torch.utils.data.DataLoader,
+        assets_dir: Path | None = None,
+    ):
         self.cfg = cfg
         self.model = model
         self.diffusion = diffusion
@@ -32,6 +39,7 @@ class Trainer:
 
         self.ckpt_dir = ckpt_dir
         self.results_dir = results_dir
+        self.assets_dir = Path(assets_dir) if assets_dir else None
         self.logger = MetricsLogger(results_dir / "metrics" / "train_log.csv")
         self.mem = GPUMemoryTracker(cfg.device)
 
@@ -114,7 +122,12 @@ class Trainer:
                 self._generate_samples(epoch)
 
         # Final artifacts
-        plot_loss_curve(self.all_losses, self.results_dir / "plots" / "loss_curve.png")
+        plot_loss_curve(
+            self.all_losses,
+            self.results_dir / "plots" / "loss_curve.png",
+            assets_dir=self.assets_dir,
+            assets_name="loss_curve.png",
+        )
         self.logger.close()
         print("Training complete.")
 
@@ -139,11 +152,20 @@ class Trainer:
             self.model, self.diffusion, n, self.device,
             capture_every=100,
         )
-        save_image_grid(images, samples_dir / "grid.png", title=f"Epoch {epoch}")
+        is_final = epoch == self.cfg.train.epochs
+        save_image_grid(
+            images, samples_dir / "grid.png", title=f"Epoch {epoch}",
+            assets_dir=self.assets_dir if is_final else None,
+            assets_name="samples_final.png",
+        )
 
         # Denoising GIF (only a few samples)
         if frames:
-            save_denoising_gif(frames, samples_dir / "denoising.gif", n_samples=8)
+            save_denoising_gif(
+                frames, samples_dir / "denoising.gif", n_samples=8,
+                assets_dir=self.assets_dir if is_final else None,
+                assets_name="denoising.gif",
+            )
 
         self.model.train()
 

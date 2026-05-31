@@ -30,6 +30,10 @@ def parse_args():
     p.add_argument("--gif", action="store_true", help="Save denoising GIF (DDPM only)")
     p.add_argument("--output", default="results/samples/manual")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--assets-dir", default=None,
+        help="Optional path to copy blog-ready images to (e.g. ../blog-luan-costa/static/images/ddpm)",
+    )
     return p.parse_args()
 
 
@@ -50,19 +54,29 @@ def main():
     diffusion = DiffusionProcess(cfg_diff, device)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = Path(args.assets_dir) if args.assets_dir else None
 
     if args.ddim:
         print(f"Sampling with DDIM ({args.steps} steps)...")
         images, elapsed = ddim_sample(model, diffusion, args.n_samples, device, n_steps=args.steps)
         print(f"Done in {elapsed:.2f}s")
-        save_image_grid(images, out_dir / f"ddim_{args.steps}steps.png", title=f"DDIM-{args.steps}")
+        save_image_grid(
+            images, out_dir / f"ddim_{args.steps}steps.png", title=f"DDIM-{args.steps}",
+            assets_dir=assets_dir, assets_name="samples_ddim.png",
+        )
     else:
         print("Sampling with DDPM (1000 steps)...")
         capture = 100 if args.gif else 0
         images, frames = ddpm_sample(model, diffusion, args.n_samples, device, capture_every=capture)
-        save_image_grid(images, out_dir / "ddpm_samples.png", title="DDPM-1000")
+        save_image_grid(
+            images, out_dir / "ddpm_samples.png", title="DDPM-1000",
+            assets_dir=assets_dir, assets_name="samples_final.png",
+        )
         if args.gif and frames:
-            save_denoising_gif(frames, out_dir / "denoising.gif")
+            save_denoising_gif(
+                frames, out_dir / "denoising.gif",
+                assets_dir=assets_dir, assets_name="denoising.gif",
+            )
             print(f"GIF saved to {out_dir}/denoising.gif")
 
     print(f"Images saved to {out_dir}")

@@ -28,7 +28,12 @@ from data.dataset import get_dataloader
 from models.unet import UNet
 from models.diffusion import DiffusionProcess
 from profiling.communication import run_all_benchmarks
-from utils.visualization import plot_h2d_bandwidth, plot_sampling_comparison, plot_training_breakdown
+from utils.visualization import (
+    plot_h2d_bandwidth,
+    plot_dataloader_comparison,
+    plot_sampling_comparison,
+    plot_training_breakdown,
+)
 
 
 def parse_args():
@@ -38,6 +43,10 @@ def parse_args():
     p.add_argument("--plots-only", default=None, help="Path to existing benchmarks.json, skip running")
     p.add_argument("--output-dir", default="results/profiling")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--assets-dir", default=None,
+        help="Optional path to copy blog-ready images to (e.g. ../blog-luan-costa/static/images/ddpm)",
+    )
     return p.parse_args()
 
 
@@ -45,11 +54,12 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
     output_dir = Path(args.output_dir)
+    assets_dir = Path(args.assets_dir) if args.assets_dir else None
 
     if args.plots_only:
         with open(args.plots_only) as f:
             results = json.load(f)
-        _generate_plots(results, output_dir)
+        _generate_plots(results, output_dir, assets_dir)
         return
 
     print(f"Running benchmarks on {device}")
@@ -73,24 +83,28 @@ def main():
     diffusion = DiffusionProcess(cfg_diff, device)
 
     results = run_all_benchmarks(cfg, model, diffusion, device, output_dir)
-    _generate_plots(results, output_dir)
+    _generate_plots(results, output_dir, assets_dir)
 
 
-def _generate_plots(results: dict, output_dir: Path) -> None:
+def _generate_plots(results: dict, output_dir: Path, assets_dir: Path | None = None) -> None:
     print("\nGenerating plots...")
     plots_dir = output_dir.parent / "plots"
 
     if "h2d_transfer" in results:
-        plot_h2d_bandwidth(results, plots_dir / "h2d_bandwidth.png")
-        print(f"  → {plots_dir}/h2d_bandwidth.png")
+        plot_h2d_bandwidth(results, plots_dir / "h2d_bandwidth.png",
+                           assets_dir=assets_dir, assets_name="h2d_bandwidth.png")
+
+    if "dataloader" in results:
+        plot_dataloader_comparison(results, plots_dir / "dataloader_comparison.png",
+                                   assets_dir=assets_dir, assets_name="dataloader_comparison.png")
 
     if "sampling_loop" in results:
-        plot_sampling_comparison(results, plots_dir / "sampling_comparison.png")
-        print(f"  → {plots_dir}/sampling_comparison.png")
+        plot_sampling_comparison(results, plots_dir / "sampling_comparison.png",
+                                 assets_dir=assets_dir, assets_name="sampling_comparison.png")
 
     if "training_step_breakdown" in results:
-        plot_training_breakdown(results, plots_dir / "training_breakdown.png")
-        print(f"  → {plots_dir}/training_breakdown.png")
+        plot_training_breakdown(results, plots_dir / "training_breakdown.png",
+                                assets_dir=assets_dir, assets_name="training_breakdown.png")
 
 
 if __name__ == "__main__":

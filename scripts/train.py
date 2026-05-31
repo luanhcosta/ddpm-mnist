@@ -36,6 +36,10 @@ def parse_args():
     p.add_argument("--sample-every", type=int, default=5)
     p.add_argument("--profile-steps", type=int, default=0)
     p.add_argument("--no-pin-memory", action="store_true")
+    p.add_argument(
+        "--assets-dir", default=None,
+        help="Optional path to copy blog-ready images to (e.g. ../blog-luan-costa/static/images/ddpm)",
+    )
     return p.parse_args()
 
 
@@ -70,7 +74,11 @@ def main():
     diffusion = DiffusionProcess(cfg.diffusion, device)
     dataloader = get_dataloader(cfg.data)
 
-    trainer = Trainer(cfg, model, diffusion, dataloader)
+    assets_dir = Path(args.assets_dir) if args.assets_dir else None
+    if assets_dir:
+        print(f"Blog assets will be saved to: {assets_dir}")
+
+    trainer = Trainer(cfg, model, diffusion, dataloader, assets_dir=assets_dir)
     trainer.train()
 
 
