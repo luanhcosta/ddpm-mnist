@@ -232,7 +232,7 @@ def plot_h2d_bandwidth(
 
     x = np.arange(len(labels))
     width = 0.35
-    fig, ax = plt.subplots(figsize=(9, 4))
+    fig, ax = plt.subplots(figsize=(10, 5))
     b1 = ax.bar(x - width / 2, pageable, width, label="Pageable memory", color="#5b8db8")
     b2 = ax.bar(x + width / 2, pinned, width, label="Pinned memory", color="#e07b54")
     for bar in list(b1) + list(b2):
@@ -242,8 +242,11 @@ def plot_h2d_bandwidth(
     ax.set_xticklabels(labels)
     ax.set_ylabel("Bandwidth (GB/s)")
     ax.set_title("Host→Device Transfer Bandwidth: Pageable vs Pinned Memory")
-    ax.legend()
+    # Place legend in upper left to avoid overlap with tallest bars on the right
+    ax.legend(loc="upper left")
     ax.grid(axis="y", alpha=0.3)
+    # Extra top margin so value labels don't clip
+    ax.set_ylim(top=max(pageable + pinned) * 1.20)
     fig.tight_layout()
     _save_fig(fig, path, assets_dir, assets_name)
 
@@ -260,27 +263,29 @@ def plot_dataloader_comparison(
     bps = [r["batches_per_second"] for r in rows]
     speedup = benchmark_results["pin_memory_speedup"]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
     colors = ["#c0392b", "#2ecc71"]
 
     bars = ax1.bar(labels, times, color=colors, edgecolor="white", width=0.5)
+    ax1.set_ylim(top=max(times) * 1.25)
     for bar, val in zip(bars, times):
-        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.02,
+        ax1.text(bar.get_x() + bar.get_width() / 2, val + max(times) * 0.02,
                  f"{val:.3f} ms", ha="center", va="bottom", fontsize=10, fontweight="bold")
     ax1.set_ylabel("Avg time per batch (ms)")
     ax1.set_title("Batch Transfer Time")
     ax1.grid(axis="y", alpha=0.3)
 
     bars = ax2.bar(labels, bps, color=colors, edgecolor="white", width=0.5)
+    ax2.set_ylim(top=max(bps) * 1.25)
     for bar, val in zip(bars, bps):
-        ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.02,
+        ax2.text(bar.get_x() + bar.get_width() / 2, val + max(bps) * 0.02,
                  f"{val:.0f}/s", ha="center", va="bottom", fontsize=10, fontweight="bold")
     ax2.set_ylabel("Batches per second")
     ax2.set_title(f"Throughput  (speedup: {speedup:.2f}×)")
     ax2.grid(axis="y", alpha=0.3)
 
     fig.suptitle("DataLoader: Effect of pin_memory on CPU→GPU Transfer", fontsize=11)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     _save_fig(fig, path, assets_dir, assets_name)
 
 
@@ -322,23 +327,32 @@ def plot_training_breakdown(
     values = list(phases.values())
     colors = plt.cm.tab10(np.linspace(0, 1, len(labels)))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     bars = ax1.barh(labels, values, color=colors)
     for bar, val in zip(bars, values):
         pct = val / b["total_ms"] * 100
-        ax1.text(val + 0.05, bar.get_y() + bar.get_height() / 2,
+        ax1.text(val + max(values) * 0.02, bar.get_y() + bar.get_height() / 2,
                  f"{val:.2f} ms  ({pct:.1f}%)", va="center", fontsize=9)
     ax1.set_xlabel("Time (ms)")
     ax1.set_title("Training Step — Phase Breakdown")
     ax1.grid(axis="x", alpha=0.3)
-    ax1.set_xlim(right=max(values) * 1.5)
+    ax1.set_xlim(right=max(values) * 1.6)
 
-    ax2.pie(values, labels=labels, colors=colors, autopct="%1.1f%%",
-            startangle=90, textprops={"fontsize": 9})
+    # Pie without inline labels — use a clean legend instead to avoid overlap
+    wedges, _ = ax2.pie(values, colors=colors, startangle=90,
+                        wedgeprops={"linewidth": 0.8, "edgecolor": "white"})
+    ax2.legend(
+        wedges,
+        [f"{l}  {v/b['total_ms']*100:.1f}%" for l, v in zip(labels, values)],
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize=9,
+        frameon=False,
+    )
     ax2.set_title(f"Time Distribution\n(total: {b['total_ms']:.2f} ms/step)")
 
     note = f"H2D transfer = {b['data_h2d_pct']:.1f}% of total step time"
-    fig.text(0.5, -0.03, note, ha="center", fontsize=10, style="italic", color="#555")
+    fig.text(0.5, 0.01, note, ha="center", fontsize=10, style="italic", color="#555")
     fig.tight_layout()
     _save_fig(fig, path, assets_dir, assets_name)

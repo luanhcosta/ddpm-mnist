@@ -257,13 +257,18 @@ def profile_training_step(
 
     data_iter = iter(dataloader)
 
+    # Use CPU-only activities on Blackwell (sm_120) — CUPTI not yet supported
+    # on this architecture, so CUDA activity collection is skipped gracefully.
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    try:
+        import ctypes
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    except Exception:
+        pass
+
     with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
+        activities=activities,
         schedule=torch.profiler.schedule(wait=1, warmup=1, active=n_steps),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(output_dir / "profiler_trace")),
         record_shapes=True,
         profile_memory=True,
         with_stack=False,
@@ -285,14 +290,19 @@ def profile_training_step(
 
             prof.step()
 
-    # Also export as standalone chrome trace JSON
-    prof.export_chrome_trace(str(output_dir / "chrome_trace.json"))
-    print(f"  Chrome trace saved to {output_dir}/chrome_trace.json")
-    print(f"  TensorBoard trace saved to {output_dir}/profiler_trace/")
+    # Export chrome trace (works even without CUDA activities)
+    trace_path = output_dir / "chrome_trace.json"
+    try:
+        prof.export_chrome_trace(str(trace_path))
+        print(f"  Chrome trace saved to {trace_path}")
+        print("  Open in Chrome at chrome://tracing")
+    except RuntimeError:
+        # on_trace_ready already saved it
+        print(f"  Trace saved via on_trace_ready to {output_dir}/profiler_trace/")
 
-    # Print top-20 ops by CUDA time
-    print("\n  Top CUDA kernels (by self CUDA time):")
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+    # Print top ops by CPU time (CUDA time unavailable on Blackwell with this CUPTI)
+    print("\n  Top ops (by self CPU time):")
+    print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=15))
 
 
 # ── 6. Training Step Timing Breakdown ────────────────────────────────────────
