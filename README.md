@@ -4,7 +4,7 @@ A Denoising Diffusion Probabilistic Model (DDPM) trained on MNIST from scratch, 
 
 This project was built as the practical counterpart to a blog post on how data moves between CPU and GPU during deep learning workloads. Every benchmark in `profiling/communication.py` was designed to produce a concrete, measurable result rather than a rule of thumb.
 
-**Hardware:** NVIDIA GeForce RTX 5050 Laptop GPU (8 GB, Blackwell sm_120) · CUDA 12.6
+**Hardware:** NVIDIA GeForce RTX 5050 Laptop GPU (8 GB, Blackwell sm_120) · CUDA 12.8
 
 ---
 
@@ -14,19 +14,24 @@ This project was built as the practical counterpart to a blog post on how data m
 
 The model generates diverse, recognizable digits from pure Gaussian noise across all 10 classes with no mode collapse.
 
-**CPU-GPU communication benchmarks (trained model):**
+**CPU-GPU communication benchmarks (trained model, median latency where applicable):**
 
 | Benchmark | Result |
 |---|---|
-| H2D bandwidth — pinned vs pageable (1 MB) | 17.3 vs 6.9 GB/s — **2.5× faster** |
-| H2D bandwidth — pinned vs pageable (100 MB) | 11.8 vs 10.6 GB/s — **1.1× faster** |
-| DataLoader throughput — pin_memory=True vs False | 14,662 vs 8,292 batches/s — **1.78×** |
-| Training step — data H2D share | **0.08 ms of 213 ms total = 0.0%** |
-| Training step — backward pass share | **140 ms = 65.8% of step time** |
-| DDPM-1000 with 1000 CPU syncs vs pure GPU | 3.94s vs 3.78s — **1.04× overhead** |
-| DDIM-50 vs DDPM-1000 | 0.20s vs 3.78s — **19.2× faster** |
+| H2D bandwidth — pinned vs pageable (1 MB) | 9.03 vs 3.75 GB/s — **2.41×** |
+| H2D bandwidth — pinned vs pageable (100 MB) | 9.76 vs 8.37 GB/s — **1.17×** |
+| MNIST batch H2D latency — pinned vs pageable | 0.158 vs 0.260 ms — **1.65×** |
+| Input-only loop (`next` + H2D) — pinned vs pageable | 3.226 vs 0.600 ms |
+| AMP training step — data H2D share | **0.134 ms of 140.867 ms = 0.1%** |
+| AMP training step — backward pass share | **87.023 ms = 61.8%** |
+| DDPM-1000, observe every step vs never | 4.844s vs 4.740s — **1.02×** |
+| DDIM-50 vs DDPM-1000 | 0.241s vs 4.740s — **19.7×** |
 
-Key insight: for a ~10M parameter model on 28×28 images, CPU-GPU data transfer is not the bottleneck. The backward pass owns 66% of step time. The benefit of pinned memory is meaningful only at small tensor sizes (< 10 MB); beyond that, PCIe bandwidth saturates both.
+Key insight: pinned memory makes the isolated H2D copy faster, but it does not
+automatically make every input loop faster. Pinning has its own host-side work,
+and true copy/compute overlap requires a pipeline designed for it. In this
+workload, H2D is only 0.1% of an AMP training step; backward computation is the
+dominant cost.
 
 ---
 
@@ -120,8 +125,7 @@ ddpm-mnist/
 ├── data/dataset.py           # MNIST DataLoader with pin_memory control
 ├── training/trainer.py       # Training loop: AMP, grad clip, profiler
 ├── sampling/
-│   └── sampler.py            # ddpm_sample, ddpm_sample_naive_sync,
-│                             # ddpm_sample_no_sync, ddim_sample
+│   └── sampler.py            # DDPM/DDIM sampling + configurable host observation
 ├── profiling/
 │   └── communication.py      # 6 CPU-GPU benchmarks + torch.profiler trace
 ├── utils/

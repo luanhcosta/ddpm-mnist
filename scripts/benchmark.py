@@ -82,7 +82,14 @@ def main():
     model.eval()
     diffusion = DiffusionProcess(cfg_diff, device)
 
-    results = run_all_benchmarks(cfg, model, diffusion, device, output_dir)
+    results = run_all_benchmarks(
+        cfg,
+        model,
+        diffusion,
+        device,
+        output_dir,
+        include_sampling=not args.no_sampling,
+    )
     _generate_plots(results, output_dir, assets_dir)
 
 
@@ -94,7 +101,7 @@ def _generate_plots(results: dict, output_dir: Path, assets_dir: Path | None = N
         plot_h2d_bandwidth(results, plots_dir / "h2d_bandwidth.png",
                            assets_dir=assets_dir, assets_name="h2d_bandwidth.png")
 
-    if "dataloader" in results:
+    if "batch_transfer" in results:
         plot_dataloader_comparison(results, plots_dir / "dataloader_comparison.png",
                                    assets_dir=assets_dir, assets_name="dataloader_comparison.png")
 

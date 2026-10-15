@@ -4,14 +4,17 @@ This module measures the concrete cost of every point where the CPU and GPU
 exchange data or control during DDPM training and inference.
 
 Benchmarks:
-    1. H2D Transfer Bandwidth   — pageable vs pinned memory, multiple tensor sizes
-    2. DataLoader Overhead       — pin_memory=True vs False during training batches
-    3. Noise Schedule Transfer   — cost of moving T precomputed tensors to GPU
-    4. Sampling Loop Sync        — 1000-step DDPM with forced syncs vs pure-GPU vs DDIM-50
-    5. Training Step Profile     — torch.profiler chrome trace of one training step
+    1. H2D transfer             — equivalent copies from pageable and pinned memory
+    2. Input pipeline           — transfer-only vs next(iterator) + transfer
+    3. Noise schedule transfer  — CPU precomputation and one-time H2D cost
+    4. Host observation         — cost of materializing GPU statistics in Python
+    5. AMP training breakdown   — phases of the actual mixed-precision path
+    6. Training profile         — torch.profiler trace of representative steps
 """
 
 import json
+import platform
+import statistics
 import time
 from pathlib import Path
 
@@ -22,7 +25,7 @@ from config.config import Config
 from data.dataset import get_dataloader
 from models.diffusion import DiffusionProcess, make_beta_schedule
 from models.unet import UNet
-from sampling.sampler import ddpm_sample_naive_sync, ddpm_sample_no_sync, ddim_sample
+from sampling.sampler import ddpm_sample_with_observation_interval, ddim_sample
 
 
 def _sync_time(fn) -> float:
@@ -34,6 +37,38 @@ def _sync_time(fn) -> float:
     return time.perf_counter() - t0
 
 
+def _stats_ms(samples_s: list[float]) -> dict:
+    """Return robust latency statistics for samples measured in seconds."""
+    samples_ms = sorted(sample * 1000 for sample in samples_s)
+    p95_index = min(len(samples_ms) - 1, int(0.95 * len(samples_ms)))
+    return {
+        "mean_ms": round(statistics.fmean(samples_ms), 4),
+        "p50_ms": round(statistics.median(samples_ms), 4),
+        "p95_ms": round(samples_ms[p95_index], 4),
+    }
+
+
+def _environment_metadata(device: torch.device, cfg: Config) -> dict:
+    metadata = {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "pytorch": torch.__version__,
+        "device": str(device),
+        "cuda_runtime": torch.version.cuda,
+        "batch_size": cfg.data.batch_size,
+        "num_workers": cfg.data.num_workers,
+        "amp": True,
+    }
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        metadata.update({
+            "gpu": props.name,
+            "gpu_memory_mb": round(props.total_memory / 1024**2),
+            "compute_capability": f"{props.major}.{props.minor}",
+        })
+    return metadata
+
+
 # ── 1. H2D Transfer Bandwidth ────────────────────────────────────────────────
 
 def benchmark_h2d_transfer(
@@ -41,12 +76,7 @@ def benchmark_h2d_transfer(
     sizes_mb: list[float] | None = None,
     n_runs: int = 30,
 ) -> dict:
-    """Measure host-to-device bandwidth for pageable vs pinned memory.
-
-    Key insight: pinned (page-locked) memory bypasses the OS page table and
-    allows the DMA engine to transfer directly, avoiding an intermediate
-    CPU-side copy. The speedup is most visible for large tensors.
-    """
+    """Measure H2D latency and bandwidth with equivalent copy operations."""
     if sizes_mb is None:
         sizes_mb = [1, 10, 50, 100, 500]
 
@@ -54,25 +84,33 @@ def benchmark_h2d_transfer(
     for mb in sizes_mb:
         n_elements = int(mb * 1024 * 1024 / 4)  # float32 = 4 bytes
 
-        # Pageable memory (standard malloc)
         pageable = torch.randn(n_elements)
-        t_pageable = []
-        for _ in range(n_runs):
-            t_pageable.append(_sync_time(lambda: pageable.to(device, non_blocking=False)))
-        bw_pageable = mb / (sum(t_pageable) / n_runs) / 1024  # GB/s
-
-        # Pinned memory (cudaMallocHost)
         pinned = torch.randn(n_elements).pin_memory()
-        t_pinned = []
         gpu_buf = torch.empty(n_elements, device=device)
+
+        gpu_buf.copy_(pageable)
+        gpu_buf.copy_(pinned)
+        torch.cuda.synchronize()
+
+        t_pageable, t_pinned = [], []
         for _ in range(n_runs):
-            t_pinned.append(_sync_time(lambda: gpu_buf.copy_(pinned, non_blocking=False)))
-        bw_pinned = mb / (sum(t_pinned) / n_runs) / 1024  # GB/s
+            # Alternating order reduces clock and thermal order bias.
+            if len(t_pageable) % 2 == 0:
+                t_pageable.append(_sync_time(lambda: gpu_buf.copy_(pageable, non_blocking=True)))
+                t_pinned.append(_sync_time(lambda: gpu_buf.copy_(pinned, non_blocking=True)))
+            else:
+                t_pinned.append(_sync_time(lambda: gpu_buf.copy_(pinned, non_blocking=True)))
+                t_pageable.append(_sync_time(lambda: gpu_buf.copy_(pageable, non_blocking=True)))
+
+        pageable_stats = _stats_ms(t_pageable)
+        pinned_stats = _stats_ms(t_pinned)
+        bw_pageable = mb / (pageable_stats["p50_ms"] / 1000) / 1024
+        bw_pinned = mb / (pinned_stats["p50_ms"] / 1000) / 1024
 
         results.append({
             "size_mb": mb,
-            "pageable_ms": round(sum(t_pageable) / n_runs * 1000, 2),
-            "pinned_ms": round(sum(t_pinned) / n_runs * 1000, 2),
+            "pageable": pageable_stats,
+            "pinned": pinned_stats,
             "pageable_gbps": round(bw_pageable, 2),
             "pinned_gbps": round(bw_pinned, 2),
             "speedup": round(bw_pinned / bw_pageable, 2),
@@ -83,19 +121,13 @@ def benchmark_h2d_transfer(
 
 # ── 2. DataLoader pin_memory ──────────────────────────────────────────────────
 
-def benchmark_dataloader(
+def benchmark_input_pipeline(
     cfg: Config,
     device: torch.device,
     n_batches: int = 50,
 ) -> dict:
-    """Compare batch loading time with and without pin_memory.
-
-    pin_memory=True pre-allocates host tensors in page-locked memory so the
-    DataLoader's background workers can start the DMA transfer immediately
-    when the main thread calls .to(device), without waiting for the OS to
-    pin the pages first.
-    """
-    rows = []
+    """Measure transfer-only and end-to-end input latency separately."""
+    transfer_rows, pipeline_rows = [], []
     for pin in (False, True):
         loader = get_dataloader(cfg.data, pin_memory=pin)
         it = iter(loader)
@@ -104,27 +136,40 @@ def benchmark_dataloader(
         batch, _ = next(it)
         batch.to(device)
 
-        times = []
+        transfer_times = []
         for _ in range(n_batches):
             try:
                 batch, _ = next(it)
             except StopIteration:
                 it = iter(loader)
                 batch, _ = next(it)
-            t = _sync_time(lambda: batch.to(device, non_blocking=pin))
-            times.append(t)
+            transfer_times.append(_sync_time(lambda: batch.to(device, non_blocking=pin)))
+        transfer_rows.append({"pin_memory": pin, **_stats_ms(transfer_times)})
 
-        avg_ms = sum(times) / len(times) * 1000
-        rows.append({
-            "pin_memory": pin,
-            "avg_ms_per_batch": round(avg_ms, 3),
-            "batches_per_second": round(1000 / avg_ms, 1),
-        })
+        pipeline_times = []
+        it = iter(loader)
+        for _ in range(n_batches):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            try:
+                batch, _ = next(it)
+            except StopIteration:
+                it = iter(loader)
+                batch, _ = next(it)
+            batch.to(device, non_blocking=pin)
+            torch.cuda.synchronize()
+            pipeline_times.append(time.perf_counter() - start)
+        pipeline_rows.append({"pin_memory": pin, **_stats_ms(pipeline_times)})
 
-    speedup = rows[0]["avg_ms_per_batch"] / rows[1]["avg_ms_per_batch"]
     return {
-        "dataloader": rows,
-        "pin_memory_speedup": round(speedup, 2),
+        "batch_transfer": transfer_rows,
+        "input_pipeline": pipeline_rows,
+        "batch_transfer_speedup_p50": round(
+            transfer_rows[0]["p50_ms"] / transfer_rows[1]["p50_ms"], 2
+        ),
+        "input_pipeline_speedup_p50": round(
+            pipeline_rows[0]["p50_ms"] / pipeline_rows[1]["p50_ms"], 2
+        ),
     }
 
 
@@ -178,7 +223,11 @@ def benchmark_noise_schedule(
             "T": T,
             "cpu_compute_then_transfer_ms": round(avg_cpu, 3),
             "gpu_direct_ms": round(avg_gpu, 3),
-            "note": "cpu+transfer is slower due to H2D overhead on small tensors",
+            "note": (
+                "CPU compute plus one-time transfer was faster in this run"
+                if avg_cpu < avg_gpu
+                else "direct GPU computation was faster in this run"
+            ),
         }
     }
 
@@ -190,41 +239,56 @@ def benchmark_sampling_loop(
     diffusion: DiffusionProcess,
     device: torch.device,
     n_samples: int = 4,
-    n_runs: int = 3,
+    n_runs: int = 5,
 ) -> dict:
-    """Compare three sampling strategies for total wall-clock time.
+    """Measure the cost of materializing GPU statistics on the host.
 
-    naive_sync   : DDPM-1000 with .item() at every step → 1000 CPU-GPU syncs
-    pure_gpu     : DDPM-1000 with one sync at the end
-    ddim_50      : DDIM with 50 steps, deterministic, one sync
-
-    The sync overhead in the naive case adds up: each .item() blocks the CPU
-    until that step's kernels complete, preventing the GPU from building up a
-    queue of work. The pure_gpu version lets the GPU run ahead continuously.
+    Each observation performs ``x.mean().item()``: a reduction, a scalar D2H
+    copy, and a host wait.  The result is intentionally described as
+    observation overhead rather than bare synchronization overhead.
     """
-    rows = []
+    intervals = (0, 100, 10, 1)
+    samples = {str(interval): [] for interval in intervals}
+    ddim_samples = []
 
-    for _ in range(n_runs):
-        _, t_naive = ddpm_sample_naive_sync(model, diffusion, n_samples, device)
-        _, t_pure = ddpm_sample_no_sync(model, diffusion, n_samples, device)
+    # A full pass stabilizes lazy initialization and GPU clocks.
+    ddpm_sample_with_observation_interval(
+        model, diffusion, n_samples, device, observation_every=0
+    )
+
+    for run in range(n_runs):
+        # Rotate execution order so no case always benefits from running later.
+        ordered = intervals[run % len(intervals):] + intervals[:run % len(intervals)]
+        for interval in ordered:
+            _, elapsed = ddpm_sample_with_observation_interval(
+                model, diffusion, n_samples, device, observation_every=interval
+            )
+            samples[str(interval)].append(elapsed)
         _, t_ddim = ddim_sample(model, diffusion, n_samples, device, n_steps=50)
+        ddim_samples.append(t_ddim)
 
-        rows.append({
-            "ddpm_naive_sync_s": round(t_naive, 3),
-            "ddpm_pure_gpu_s": round(t_pure, 3),
-            "ddim_50_s": round(t_ddim, 3),
-        })
-
-    avg = lambda key: round(sum(r[key] for r in rows) / n_runs, 3)
+    averages = {
+        key: round(statistics.median(samples[key]), 3)
+        for key in map(str, intervals)
+    }
+    ddim_avg = round(statistics.median(ddim_samples), 3)
+    baseline = averages["0"]
     return {
         "sampling_loop": {
             "n_samples": n_samples,
             "n_runs": n_runs,
-            "ddpm_1000_naive_sync_s": avg("ddpm_naive_sync_s"),
-            "ddpm_1000_pure_gpu_s": avg("ddpm_pure_gpu_s"),
-            "ddim_50_s": avg("ddim_50_s"),
-            "sync_overhead_factor": round(avg("ddpm_naive_sync_s") / avg("ddpm_pure_gpu_s"), 2),
-            "ddim_speedup_vs_ddpm": round(avg("ddpm_pure_gpu_s") / avg("ddim_50_s"), 1),
+            "aggregation": "median; rotated case order after one warmup pass",
+            "observation": {
+                "never_s": averages["0"],
+                "every_100_steps_s": averages["100"],
+                "every_10_steps_s": averages["10"],
+                "every_step_s": averages["1"],
+            },
+            "every_step_overhead_ms": round((averages["1"] - baseline) * 1000, 1),
+            "every_step_overhead_factor": round(averages["1"] / baseline, 2),
+            "ddim_50_s": ddim_avg,
+            "ddim_speedup_vs_ddpm": round(baseline / ddim_avg, 1),
+            "measurement": "x.mean().item(): reduction + scalar D2H copy + host wait",
         }
     }
 
@@ -253,6 +317,7 @@ def profile_training_step(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
+    scaler = torch.amp.GradScaler("cuda")
     model.train()
 
     data_iter = iter(dataloader)
@@ -283,10 +348,14 @@ def profile_training_step(
             x = x.to(device, non_blocking=True)
             t = torch.randint(0, diffusion.T, (x.size(0),), device=device)
 
-            optimizer.zero_grad()
-            loss = diffusion.loss(model, x, t)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda"):
+                loss = diffusion.loss(model, x, t)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
             prof.step()
 
@@ -314,23 +383,14 @@ def benchmark_training_step(
     device: torch.device,
     n_steps: int = 100,
 ) -> dict:
-    """Break down each phase of a training step.
-
-    Phases timed separately:
-      - data_load_h2d: time to load batch from DataLoader + copy to GPU
-      - noise_sample:  torch.randn_like (GPU-only, no H2D)
-      - forward:       model(xt, t)
-      - loss:          F.mse_loss
-      - backward:      loss.backward()
-      - optimizer:     optimizer.step()
-
-    torch.cuda.synchronize() is called before each timer to ensure we measure
-    actual GPU execution time, not just kernel dispatch latency.
-    """
+    """Break down the actual AMP training path into synchronized phases."""
     optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
+    scaler = torch.amp.GradScaler("cuda")
     model.train()
 
-    phase_times = {k: [] for k in ["data_h2d", "noise_t_sample", "forward", "loss", "backward", "optimizer"]}
+    phase_times = {k: [] for k in [
+        "data_h2d", "noise_and_q_sample", "forward", "loss", "backward", "optimizer_and_clip"
+    ]}
 
     data_iter = iter(dataloader)
 
@@ -341,12 +401,16 @@ def benchmark_training_step(
         except StopIteration:
             data_iter = iter(dataloader)
             x, _ = next(data_iter)
-        x = x.to(device)
+        x = x.to(device, non_blocking=dataloader.pin_memory)
         t = torch.randint(0, diffusion.T, (x.size(0),), device=device)
-        loss = diffusion.loss(model, x, t)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda"):
+            loss = diffusion.loss(model, x, t)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
     for _ in range(n_steps):
         # Phase 1: data loading + H2D transfer
@@ -355,41 +419,57 @@ def benchmark_training_step(
         except StopIteration:
             data_iter = iter(dataloader)
             cpu_batch, _ = next(data_iter)
-        t_h2d = _sync_time(lambda: cpu_batch.to(device, non_blocking=False))
-        x = cpu_batch.to(device)
+        x_holder = [None]
+        t_h2d = _sync_time(
+            lambda: x_holder.__setitem__(
+                0, cpu_batch.to(device, non_blocking=dataloader.pin_memory)
+            )
+        )
+        x = x_holder[0]
 
         # Phase 2: sample noise + timestep (pure GPU ops, no H2D)
-        def sample_noise_t():
-            nonlocal noise, ts
+        def sample_noise_and_q():
+            nonlocal noise, ts, xt
             noise = torch.randn_like(x)
             ts = torch.randint(0, diffusion.T, (x.size(0),), device=device)
-        noise, ts = None, None
-        t_noise = _sync_time(sample_noise_t)
+            xt = diffusion.q_sample(x, ts, noise)
+        noise, ts, xt = None, None, None
+        t_noise = _sync_time(sample_noise_and_q)
 
         # Phase 3: forward pass
-        xt = diffusion.q_sample(x, ts, noise)
+        optimizer.zero_grad(set_to_none=True)
         forward_out = [None]
-        t_fwd = _sync_time(lambda: forward_out.__setitem__(0, model(xt, ts)))
+        def forward_amp():
+            with torch.amp.autocast("cuda"):
+                forward_out[0] = model(xt, ts)
+        t_fwd = _sync_time(forward_amp)
         pred = forward_out[0]
 
         # Phase 4: loss computation
         import torch.nn.functional as F
         loss_val = [None]
-        t_loss = _sync_time(lambda: loss_val.__setitem__(0, F.mse_loss(pred, noise)))
+        def loss_amp():
+            with torch.amp.autocast("cuda"):
+                loss_val[0] = F.mse_loss(pred, noise)
+        t_loss = _sync_time(loss_amp)
 
         # Phase 5: backward
-        optimizer.zero_grad()
-        t_bwd = _sync_time(lambda: loss_val[0].backward())
+        t_bwd = _sync_time(lambda: scaler.scale(loss_val[0]).backward())
 
-        # Phase 6: optimizer step
-        t_opt = _sync_time(optimizer.step)
+        # Phase 6: unscale, gradient clipping, optimizer step, scaler update
+        def optimizer_amp():
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        t_opt = _sync_time(optimizer_amp)
 
         phase_times["data_h2d"].append(t_h2d * 1000)
-        phase_times["noise_t_sample"].append(t_noise * 1000)
+        phase_times["noise_and_q_sample"].append(t_noise * 1000)
         phase_times["forward"].append(t_fwd * 1000)
         phase_times["loss"].append(t_loss * 1000)
         phase_times["backward"].append(t_bwd * 1000)
-        phase_times["optimizer"].append(t_opt * 1000)
+        phase_times["optimizer_and_clip"].append(t_opt * 1000)
 
     averages = {k: round(sum(v) / len(v), 3) for k, v in phase_times.items()}
     total = sum(averages.values())
@@ -397,6 +477,7 @@ def benchmark_training_step(
     return {
         "training_step_breakdown": {
             "n_steps": n_steps,
+            "amp": True,
             "phases_avg_ms": averages,
             "total_ms": round(total, 3),
             "data_h2d_pct": round(averages["data_h2d"] / total * 100, 1),
@@ -412,23 +493,27 @@ def run_all_benchmarks(
     diffusion: DiffusionProcess,
     device: torch.device,
     output_dir: Path,
+    include_sampling: bool = True,
 ) -> dict:
     """Run all benchmarks, print a summary, and save results to JSON."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    results = {}
+    results = {"metadata": _environment_metadata(device, cfg)}
 
     print("\n[1/6] H2D Transfer Bandwidth...")
     results.update(benchmark_h2d_transfer(device))
 
-    print("[2/6] DataLoader pin_memory overhead...")
+    print("[2/6] Batch transfer and end-to-end input pipeline...")
     dataloader = get_dataloader(cfg.data)
-    results.update(benchmark_dataloader(cfg, device))
+    results.update(benchmark_input_pipeline(cfg, device))
 
     print("[3/6] Noise schedule precomputation...")
     results.update(benchmark_noise_schedule(cfg, device))
 
-    print("[4/6] Sampling loop sync overhead...")
-    results.update(benchmark_sampling_loop(model, diffusion, device))
+    if include_sampling:
+        print("[4/6] Sampling host-observation overhead...")
+        results.update(benchmark_sampling_loop(model, diffusion, device))
+    else:
+        print("[4/6] Sampling host-observation overhead... skipped")
 
     print("[5/6] Training step breakdown...")
     results.update(benchmark_training_step(model, diffusion, dataloader, device))
@@ -456,20 +541,20 @@ def _print_summary(results: dict) -> None:
         for r in results["h2d_transfer"]:
             print(f"{r['size_mb']:>7}MB  {r['pageable_gbps']:>10.2f}GB/s  {r['pinned_gbps']:>10.2f}GB/s  {r['speedup']:>7.2f}x")
 
-    if "dataloader" in results:
+    if "batch_transfer" in results:
         print("\n── DataLoader Overhead ──────────────────────────────────────")
-        for r in results["dataloader"]:
-            label = "pin=True " if r["pin_memory"] else "pin=False"
-            print(f"  {label}: {r['avg_ms_per_batch']:.3f} ms/batch  ({r['batches_per_second']:.1f} batches/s)")
-        print(f"  Speedup: {results['pin_memory_speedup']:.2f}x")
+        for key in ("batch_transfer", "input_pipeline"):
+            print(f"  {key}:")
+            for r in results[key]:
+                print(f"    pin={r['pin_memory']}: p50={r['p50_ms']:.4f} ms, p95={r['p95_ms']:.4f} ms")
 
     if "sampling_loop" in results:
         s = results["sampling_loop"]
         print("\n── Sampling Loop Sync Overhead ──────────────────────────────")
-        print(f"  DDPM-1000 (naive sync):  {s['ddpm_1000_naive_sync_s']:.3f}s")
-        print(f"  DDPM-1000 (pure GPU):    {s['ddpm_1000_pure_gpu_s']:.3f}s")
+        for label, value in s["observation"].items():
+            print(f"  {label:22s}: {value:.3f}s")
         print(f"  DDIM-50   (pure GPU):    {s['ddim_50_s']:.3f}s")
-        print(f"  Sync overhead:   {s['sync_overhead_factor']:.2f}x slower")
+        print(f"  Every-step observation: {s['every_step_overhead_factor']:.2f}x")
         print(f"  DDIM speedup:    {s['ddim_speedup_vs_ddpm']:.1f}x vs DDPM")
 
     if "training_step_breakdown" in results:
