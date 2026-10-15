@@ -54,13 +54,27 @@ def ddpm_sample_naive_sync(
     n_samples: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, float]:
-    """DDPM sampling with a forced CPU synchronization at every step.
+    """Compatibility wrapper: materialize one GPU statistic every step."""
+    return ddpm_sample_with_observation_interval(
+        model, diffusion, n_samples, device, observation_every=1
+    )
 
-    Calling .item() on a GPU tensor forces cudaDeviceSynchronize() — the CPU
-    blocks until the GPU finishes that operation before continuing.
-    With T=1000 steps, this produces 1000 sync points.
 
-    Returns (images, time_seconds).
+@torch.no_grad()
+def ddpm_sample_with_observation_interval(
+    model: UNet,
+    diffusion: DiffusionProcess,
+    n_samples: int,
+    device: torch.device,
+    observation_every: int = 0,
+) -> tuple[torch.Tensor, float]:
+    """Time DDPM sampling while periodically materializing a GPU value on CPU.
+
+    ``x.mean().item()`` deliberately combines a reduction kernel, a scalar
+    device-to-host copy, and the wait required before Python can consume the
+    result.  It models logging/monitoring in a loop; it is not a measurement of
+    a bare CUDA synchronization.  Set ``observation_every=0`` to avoid
+    observations inside the loop.
     """
     model.eval()
     shape = (n_samples, 1, 28, 28)
@@ -81,8 +95,8 @@ def ddpm_sample_naive_sync(
         else:
             x = mean
 
-        # Force CPU-GPU sync: CPU reads a scalar from GPU memory at every step
-        _ = x.mean().item()
+        if observation_every > 0 and t_idx % observation_every == 0:
+            _ = x.mean().item()
 
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t_start
@@ -96,36 +110,10 @@ def ddpm_sample_no_sync(
     n_samples: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, float]:
-    """DDPM sampling with no CPU synchronization during the loop.
-
-    The GPU executes all 1000 denoising steps as a continuous stream of
-    kernel launches. The CPU only synchronizes once at the end, when we
-    call torch.cuda.synchronize() to get the accurate wall-clock time.
-
-    Returns (images, time_seconds).
-    """
-    model.eval()
-    shape = (n_samples, 1, 28, 28)
-    x = torch.randn(shape, device=device)
-
-    torch.cuda.synchronize()
-    t_start = time.perf_counter()
-
-    for t_idx in reversed(range(diffusion.T)):
-        t_batch = torch.full((n_samples,), t_idx, device=device, dtype=torch.long)
-        predicted_noise = model(x, t_batch)
-        mean = diffusion.p_mean(predicted_noise, x, t_batch)
-
-        if t_idx > 0:
-            noise = torch.randn_like(x)
-            variance = diffusion.posterior_variance[t_idx]
-            x = mean + torch.sqrt(variance) * noise
-        else:
-            x = mean
-
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t_start
-    return x, elapsed
+    """Compatibility wrapper: sample without host observations in the loop."""
+    return ddpm_sample_with_observation_interval(
+        model, diffusion, n_samples, device, observation_every=0
+    )
 
 
 @torch.no_grad()

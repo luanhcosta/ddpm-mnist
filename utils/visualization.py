@@ -257,34 +257,34 @@ def plot_dataloader_comparison(
     assets_dir: Path | None = None,
     assets_name: str = "dataloader_comparison.png",
 ) -> None:
-    rows = benchmark_results["dataloader"]
-    labels = ["pin_memory=False", "pin_memory=True"]
-    times = [r["avg_ms_per_batch"] for r in rows]
-    bps = [r["batches_per_second"] for r in rows]
-    speedup = benchmark_results["pin_memory_speedup"]
+    transfer = benchmark_results["batch_transfer"]
+    pipeline = benchmark_results["input_pipeline"]
+    labels = ["pageable", "pinned"]
+    transfer_p50 = [r["p50_ms"] for r in transfer]
+    pipeline_p50 = [r["p50_ms"] for r in pipeline]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
     colors = ["#c0392b", "#2ecc71"]
 
-    bars = ax1.bar(labels, times, color=colors, edgecolor="white", width=0.5)
-    ax1.set_ylim(top=max(times) * 1.25)
-    for bar, val in zip(bars, times):
-        ax1.text(bar.get_x() + bar.get_width() / 2, val + max(times) * 0.02,
+    bars = ax1.bar(labels, transfer_p50, color=colors, edgecolor="white", width=0.5)
+    ax1.set_ylim(top=max(transfer_p50) * 1.25)
+    for bar, val in zip(bars, transfer_p50):
+        ax1.text(bar.get_x() + bar.get_width() / 2, val + max(transfer_p50) * 0.02,
                  f"{val:.3f} ms", ha="center", va="bottom", fontsize=10, fontweight="bold")
-    ax1.set_ylabel("Avg time per batch (ms)")
-    ax1.set_title("Batch Transfer Time")
+    ax1.set_ylabel("Median latency (ms)")
+    ax1.set_title("H2D transfer only")
     ax1.grid(axis="y", alpha=0.3)
 
-    bars = ax2.bar(labels, bps, color=colors, edgecolor="white", width=0.5)
-    ax2.set_ylim(top=max(bps) * 1.25)
-    for bar, val in zip(bars, bps):
-        ax2.text(bar.get_x() + bar.get_width() / 2, val + max(bps) * 0.02,
-                 f"{val:.0f}/s", ha="center", va="bottom", fontsize=10, fontweight="bold")
-    ax2.set_ylabel("Batches per second")
-    ax2.set_title(f"Throughput  (speedup: {speedup:.2f}×)")
+    bars = ax2.bar(labels, pipeline_p50, color=colors, edgecolor="white", width=0.5)
+    ax2.set_ylim(top=max(pipeline_p50) * 1.25)
+    for bar, val in zip(bars, pipeline_p50):
+        ax2.text(bar.get_x() + bar.get_width() / 2, val + max(pipeline_p50) * 0.02,
+                 f"{val:.3f} ms", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax2.set_ylabel("Median latency (ms)")
+    ax2.set_title("next(iterator) + H2D")
     ax2.grid(axis="y", alpha=0.3)
 
-    fig.suptitle("DataLoader: Effect of pin_memory on CPU→GPU Transfer", fontsize=11)
+    fig.suptitle("Pinned memory: microbenchmark vs input pipeline", fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     _save_fig(fig, path, assets_dir, assets_name)
 
@@ -296,9 +296,9 @@ def plot_sampling_comparison(
     assets_name: str = "sampling_comparison.png",
 ) -> None:
     s = benchmark_results["sampling_loop"]
-    labels = ["DDPM-1000\n(1000 CPU syncs)", "DDPM-1000\n(pure GPU)", "DDIM-50\n(pure GPU)"]
-    values = [s["ddpm_1000_naive_sync_s"], s["ddpm_1000_pure_gpu_s"], s["ddim_50_s"]]
-    colors = ["#c0392b", "#2ecc71", "#3498db"]
+    labels = ["Never", "Every 100", "Every 10", "Every step"]
+    values = list(s["observation"].values())
+    colors = ["#2ecc71", "#5b8db8", "#e67e22", "#c0392b"]
 
     fig, ax = plt.subplots(figsize=(8, 4))
     bars = ax.bar(labels, values, color=colors, edgecolor="white", width=0.5)
@@ -307,8 +307,7 @@ def plot_sampling_comparison(
                 f"{val:.2f}s", ha="center", va="bottom", fontsize=11, fontweight="bold")
     ax.set_ylabel("Time (seconds)")
     ax.set_title(
-        f"Sampling {s['n_samples']} images — Sync overhead: {s['sync_overhead_factor']:.2f}× | "
-        f"DDIM speedup: {s['ddim_speedup_vs_ddpm']:.1f}×"
+        f"Sampling {s['n_samples']} images — cost of x.mean().item() observation frequency"
     )
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -323,7 +322,15 @@ def plot_training_breakdown(
 ) -> None:
     b = benchmark_results["training_step_breakdown"]
     phases = b["phases_avg_ms"]
-    labels = list(phases.keys())
+    display_names = {
+        "data_h2d": "data H2D",
+        "noise_and_q_sample": "noise + q_sample",
+        "forward": "forward",
+        "loss": "loss",
+        "backward": "backward",
+        "optimizer_and_clip": "optimizer + clip",
+    }
+    labels = [display_names.get(name, name) for name in phases]
     values = list(phases.values())
     colors = plt.cm.tab10(np.linspace(0, 1, len(labels)))
 
